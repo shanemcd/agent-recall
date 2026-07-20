@@ -246,7 +246,12 @@ Possible values:
   "Whether resumed sessions append to the original transcript file.
 When non-nil (the default), resuming a session continues writing to
 the same transcript file, keeping the full conversation in one place.
-When nil, agent-shell creates a new transcript file as usual."
+When nil, agent-shell creates a new transcript file as usual.
+
+When continuing a transcript that is open in a buffer (for example after
+`agent-recall-browse'), that visiting buffer is killed first so
+agent-shell can append without Emacs prompting that the file changed
+on disk."
   :type 'boolean
   :group 'agent-recall)
 
@@ -1197,6 +1202,21 @@ default `agent-shell-agent-configs' list."
                       (agent-recall--agent-config-matches-name-p config agent-name))
                     agent-shell-agent-configs)))))
 
+(defun agent-recall--release-visiting-buffer (file)
+  "Kill any buffer visiting FILE so agent-shell can append safely.
+Leaving the Browse/transcript buffer open while resume continues the
+same file makes Emacs treat each append as an external change and
+prompt \"changed on disk; really edit the buffer?\" — often in a loop
+while the minibuffer is busy."
+  (when-let ((buf (and file (find-buffer-visiting file))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (set-buffer-modified-p nil)
+        ;; Avoid save/lock queries while killing from inside `r'.
+        (set-visited-file-name nil t))
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf)))))
+
 (defun agent-recall--start-resume (session-id &optional transcript-file)
   "Resume SESSION-ID using agent-shell, skipping shell picker.
 Uses the transcript Agent header to select the original agent when
@@ -1217,11 +1237,16 @@ When TRANSCRIPT-FILE is provided, sets working directory from the transcript."
                                           transcript-agent)
                                 "Resume with agent: "))
                      (error "No agent config found")))
-         (shell-buffer (agent-shell--start :config config
+         shell-buffer)
+    ;; Drop the Browse/transcript buffer before the shell starts appending
+    ;; (often this kills the buffer that invoked resume via `r').
+    (when (and transcript-file agent-recall-resume-continue-transcript)
+      (agent-recall--release-visiting-buffer transcript-file))
+    (setq shell-buffer (agent-shell--start :config config
                                            :session-id session-id
                                            :session-strategy 'new
                                            :no-focus t
-                                           :new-session t)))
+                                           :new-session t))
     (when (and transcript-file agent-recall-resume-continue-transcript)
       (with-current-buffer shell-buffer
         (setq-local agent-shell--transcript-file transcript-file)))

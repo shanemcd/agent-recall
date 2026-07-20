@@ -165,6 +165,15 @@
 ;; agent-recall--read-embedded-session-id (org)
 ;; ---------------------------------------------------------------------------
 
+(ert-deftest test-release-visiting-buffer ()
+  "Resume must drop visiting buffers before appending to a transcript."
+  (with-test-md-file f "# Transcript\n\n---\n\n## User\nHi\n"
+    (let ((buf (find-file-noselect f)))
+      (should (eq buf (find-buffer-visiting f)))
+      (agent-recall--release-visiting-buffer f)
+      (should-not (buffer-live-p buf))
+      (should-not (find-buffer-visiting f)))))
+
 (ert-deftest test-read-session-id-org ()
   (with-test-file f (format "#+TITLE: Test\n#+PROPERTY: Working_Directory /tmp\n#+PROPERTY: Session %s\n\n** User\nHi\n" test-uuid)
     (should (equal (agent-recall--read-embedded-session-id f) test-uuid))))
