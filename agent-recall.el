@@ -360,44 +360,100 @@ Writes to a temporary file then renames to `agent-recall-index-file'."
         (insert "\n"))
       (rename-file temp file t)))))
 
+(defun agent-recall--search-base-dir ()
+  "Return the search symlink directory path (may not exist yet)."
+  (expand-file-name "search" (file-name-directory
+                              (expand-file-name agent-recall-index-file))))
+
+(defun agent-recall--under-search-base-p (path)
+  "Return non-nil if PATH is the search symlink dir or a path beneath it."
+  (when path
+    (let* ((base (file-name-as-directory (agent-recall--search-base-dir)))
+           (expanded (expand-file-name path))
+           (as-dir (file-name-as-directory expanded)))
+      (or (string-equal as-dir base)
+          (string-prefix-p base as-dir)
+          (string-prefix-p base expanded)))))
+
+(defun agent-recall--canonical-transcript-path (file)
+  "Return a stable real path for transcript FILE.
+Paths opened via the search symlink tree are resolved with
+`file-truename' so the index never stores entries under
+`agent-recall--search-base-dir'."
+  (when file
+    (let ((expanded (expand-file-name file)))
+      (cond
+       ((not (file-exists-p expanded)) expanded)
+       ((agent-recall--under-search-base-p expanded)
+        (file-truename expanded))
+       (t expanded)))))
+
+(defun agent-recall--index-prune-search-paths ()
+  "Remove index entries whose file or :dir lives under the search symlink dir.
+Returns the number of removed entries."
+  (let ((stale '()))
+    (when agent-recall--index
+      (maphash (lambda (file entry)
+                 (when (or (agent-recall--under-search-base-p file)
+                           (agent-recall--under-search-base-p
+                            (plist-get entry :dir)))
+                   (push file stale)))
+               agent-recall--index)
+      (when stale
+        (dolist (file stale)
+          (remhash file agent-recall--index))
+        (agent-recall--index-save)))
+    (length stale)))
+
 (defun agent-recall--index-add (file &optional session-id)
   "Add transcript FILE to the index with optional SESSION-ID.
 Derives project name, directory, and timestamp from the file path.
-Extracts a preview from the file content.  Saves the index to disk."
+Extracts a preview from the file content.  Saves the index to disk.
+FILE is canonicalized so search-symlink paths are not indexed."
   (agent-recall--index-ensure)
-  (let* ((dir (file-name-directory file))
-         (project (agent-recall--project-name dir))
-         (basename (file-name-sans-extension (file-name-nondirectory file)))
-         (preview (when (file-exists-p file)
-                    (agent-recall--transcript-preview file))))
-    (puthash file
-             (list :project project
-                   :dir (directory-file-name dir)
-                   :timestamp basename
-                   :session-id session-id
-                   :preview (or preview "(empty)"))
-             agent-recall--index)
-    (agent-recall--index-save)))
+  (when-let* ((file (agent-recall--canonical-transcript-path file))
+              ((not (agent-recall--under-search-base-p file))))
+    (let* ((dir (file-name-directory file))
+           (project (agent-recall--project-name dir))
+           (basename (file-name-sans-extension (file-name-nondirectory file)))
+           (preview (when (file-exists-p file)
+                      (agent-recall--transcript-preview file))))
+      (puthash file
+               (list :project project
+                     :dir (directory-file-name dir)
+                     :timestamp basename
+                     :session-id session-id
+                     :preview (or preview "(empty)"))
+               agent-recall--index)
+      (agent-recall--index-save))))
 
 (defun agent-recall--index-ensure ()
   "Ensure the index is loaded into memory.
 Loads from disk if not yet loaded this session.  If no index file
-exists, sets an empty hash-table and notifies the user."
+exists, sets an empty hash-table and notifies the user.
+Also drops any stale entries under the search symlink directory."
   (unless agent-recall--index-loaded-p
     (agent-recall--index-load)
     (when (zerop (hash-table-count agent-recall--index))
       (unless (file-exists-p agent-recall-index-file)
-        (message "No transcript index found.  Run M-x agent-recall-reindex to build one.")))))
+        (message "No transcript index found.  Run M-x agent-recall-reindex to build one."))))
+  (agent-recall--index-prune-search-paths))
 
 (defun agent-recall--index-dirs ()
-  "Return a deduplicated list of transcript directories from the index."
+  "Return a deduplicated list of real transcript directories from the index.
+Excludes the search symlink tree and resolves directory symlinks."
   (agent-recall--index-ensure)
   (let ((dirs (make-hash-table :test 'equal)))
     (maphash (lambda (_file entry)
-               (puthash (plist-get entry :dir) t dirs))
+               (let ((dir (plist-get entry :dir)))
+                 (when (and dir
+                            (not (agent-recall--under-search-base-p dir))
+                            (file-directory-p dir))
+                   (puthash (directory-file-name
+                             (file-truename (expand-file-name dir)))
+                            t dirs))))
              agent-recall--index)
     (hash-table-keys dirs)))
-
 (defun agent-recall--index-files ()
   "Return all indexed transcript file paths, skipping non-existent files."
   (agent-recall--index-ensure)
@@ -591,44 +647,65 @@ backslash in the argv (e.g. \"\\\\*.md\"), and ripgrep would match nothing."
   "Create a directory with symlinks to all transcript dirs.
 Returns the path.  Each symlink is named PROJECT-COUNT to avoid
 collisions when multiple projects share a name.
-The directory lives alongside `agent-recall-index-file'."
-  (let* ((base (expand-file-name "search" (file-name-directory agent-recall-index-file)))
+The directory lives alongside `agent-recall-index-file'.
+
+Link targets are real directories only.  Paths under the search tree
+itself are ignored so a polluted index cannot recreate self-referential
+symlinks (which break unlock-file / ripgrep with ELOOP)."
+  (let* ((base (agent-recall--search-base-dir))
          (dirs (agent-recall--index-dirs)))
     (when (file-exists-p base)
       (delete-directory base t))
     (make-directory base t)
     (let ((seen (make-hash-table :test 'equal)))
       (dolist (dir dirs)
-        (let* ((project (condition-case nil
-                            (agent-recall--project-name dir)
-                          (error (file-name-nondirectory
-                                  (directory-file-name dir)))))
-               (count (gethash project seen 0))
-               (link-name (if (= count 0) project
-                            (format "%s-%d" project count))))
-          (puthash project (1+ count) seen)
-          (condition-case nil
-              (make-symbolic-link dir (expand-file-name link-name base) t)
-            (error nil)))))
+        (let ((target (ignore-errors
+                        (file-truename (expand-file-name dir)))))
+          (when (and target
+                     (file-directory-p target)
+                     (not (agent-recall--under-search-base-p target)))
+            (let* ((project (condition-case nil
+                                (agent-recall--project-name target)
+                              (error (file-name-nondirectory
+                                      (directory-file-name target)))))
+                   (count (gethash project seen 0))
+                   (link-name (if (= count 0) project
+                                (format "%s-%d" project count)))
+                   (link (expand-file-name link-name base)))
+              (puthash project (1+ count) seen)
+              (condition-case nil
+                  (make-symbolic-link target link t)
+                (error nil)))))))
     (setq agent-recall--symlink-dir base)
     base))
-
 (defun agent-recall--install-transcript-hook ()
   "Add transcript-mode hook to `find-file-hook' if not already present."
   (unless (memq #'agent-recall--maybe-enable-from-search find-file-hook)
     (add-hook 'find-file-hook #'agent-recall--maybe-enable-from-search)))
 
+(defun agent-recall--canonicalize-visited-transcript ()
+  "If visiting a search-symlink transcript path, retarget to the real file.
+Consult/ripgrep open hits under the search tree; without this, resume and
+indexing can record those symlink paths and later recreate ELOOP links."
+  (when-let* ((file (buffer-file-name))
+              ((agent-recall--under-search-base-p file))
+              (real (ignore-errors (file-truename file)))
+              ((and real
+                    (file-exists-p real)
+                    (not (equal (expand-file-name file) real)))))
+    (set-visited-file-name real t t)))
+
 (defun agent-recall--maybe-enable-from-search ()
   "Enable transcript-mode if file is a transcript opened from agent-recall.
 Only activates when `agent-recall-auto-transcript-mode' is non-nil and
 an agent-recall search buffer exists in the current session."
+  (agent-recall--canonicalize-visited-transcript)
   (when (and agent-recall-auto-transcript-mode
              (agent-recall--transcript-file-p (buffer-file-name))
              (cl-some (lambda (buf)
                         (buffer-local-value 'agent-recall--search-buffer-p buf))
                       (buffer-list)))
     (agent-recall-transcript-mode 1)))
-
 (defun agent-recall--search-via-grep (query dirs)
   "Search DIRS for QUERY using grep with results in `grep-mode'.
 Falls back to standard grep, available on all systems."
@@ -686,6 +763,7 @@ DIRS are unused; consult-ripgrep searches the symlink directory instead."
                   " --follow "
                   (agent-recall--file-patterns-as-globs))))
     (consult-ripgrep dir query)
+    (agent-recall--canonicalize-visited-transcript)
     (when (and agent-recall-auto-transcript-mode
                (agent-recall--transcript-file-p (buffer-file-name)))
       (agent-recall-transcript-mode 1))))
@@ -791,14 +869,15 @@ and org-mode transcript formats."
 
 (defun agent-recall--open-transcript (file &optional other-window)
   "Open transcript FILE and enable `agent-recall-transcript-mode' if configured.
-When OTHER-WINDOW is non-nil, open in another window."
+When OTHER-WINDOW is non-nil, open in another window.
+Search-symlink paths are resolved to their real file before visiting."
+  (setq file (or (agent-recall--canonical-transcript-path file) file))
   (if other-window
       (find-file-other-window file)
     (find-file file))
   (goto-char (point-min))
   (when agent-recall-auto-transcript-mode
     (agent-recall-transcript-mode 1)))
-
 (defun agent-recall--browse-preview-state (file-lookup)
   "Return a consult state function for live preview of transcripts.
 FILE-LOOKUP is a hash table mapping display strings to file paths.
@@ -1051,24 +1130,26 @@ When the transcript has a resumable session ID, press `r' to resume."
   :lighter " Recall"
   :keymap agent-recall-transcript-mode-map
   (if agent-recall-transcript-mode
-      (let ((session-id (agent-recall--resolve-session-id (buffer-file-name))))
-        (setq-local agent-recall--transcript-session-id session-id)
-        (read-only-mode 1)
-        ;; Evil-compatible keybinding
-        (when (bound-and-true-p evil-mode)
-          (evil-local-set-key 'normal (kbd "r") #'agent-recall-resume-current)
-          (evil-local-set-key 'normal (kbd "R") #'agent-recall-force-resume-current)
-          (evil-local-set-key 'normal (kbd "c") #'agent-recall-clean-view)
-          (evil-local-set-key 'normal (kbd "C-j") #'agent-recall-next-user-message)
-          (evil-local-set-key 'normal (kbd "C-k") #'agent-recall-prev-user-message)
-          (evil-local-set-key 'normal (kbd "]]") #'agent-recall-next-user-message)
-          (evil-local-set-key 'normal (kbd "[[") #'agent-recall-prev-user-message)
-          (evil-local-set-key 'normal (kbd "gj") #'agent-recall-next-user-message)
-          (evil-local-set-key 'normal (kbd "gk") #'agent-recall-prev-user-message)
-          (evil-local-set-key 'normal (kbd "b") #'agent-recall-browse-from-transcript)
-          (evil-local-set-key 'normal (kbd "q") #'quit-window))
-        (setq-local header-line-format
-                    '(:eval (agent-recall--header-line agent-recall--transcript-session-id))))
+      (progn
+        (agent-recall--canonicalize-visited-transcript)
+        (let ((session-id (agent-recall--resolve-session-id (buffer-file-name))))
+          (setq-local agent-recall--transcript-session-id session-id)
+          (read-only-mode 1)
+          ;; Evil-compatible keybinding
+          (when (bound-and-true-p evil-mode)
+            (evil-local-set-key 'normal (kbd "r") #'agent-recall-resume-current)
+            (evil-local-set-key 'normal (kbd "R") #'agent-recall-force-resume-current)
+            (evil-local-set-key 'normal (kbd "c") #'agent-recall-clean-view)
+            (evil-local-set-key 'normal (kbd "C-j") #'agent-recall-next-user-message)
+            (evil-local-set-key 'normal (kbd "C-k") #'agent-recall-prev-user-message)
+            (evil-local-set-key 'normal (kbd "]]") #'agent-recall-next-user-message)
+            (evil-local-set-key 'normal (kbd "[[") #'agent-recall-prev-user-message)
+            (evil-local-set-key 'normal (kbd "gj") #'agent-recall-next-user-message)
+            (evil-local-set-key 'normal (kbd "gk") #'agent-recall-prev-user-message)
+            (evil-local-set-key 'normal (kbd "b") #'agent-recall-browse-from-transcript)
+            (evil-local-set-key 'normal (kbd "q") #'quit-window))
+          (setq-local header-line-format
+                      '(:eval (agent-recall--header-line agent-recall--transcript-session-id)))))
     (read-only-mode -1)
     (kill-local-variable 'agent-recall--transcript-session-id)
     (kill-local-variable 'header-line-format)))
@@ -1090,9 +1171,9 @@ and files in `agent-recall-extra-transcript-dirs'."
 
 (defun agent-recall--maybe-enable-transcript-mode ()
   "Enable `agent-recall-transcript-mode' if visiting a transcript file."
+  (agent-recall--canonicalize-visited-transcript)
   (when (agent-recall--transcript-file-p (buffer-file-name))
     (agent-recall-transcript-mode 1)))
-
 ;;;###autoload
 (define-globalized-minor-mode global-agent-recall-transcript-mode
   agent-recall-transcript-mode agent-recall--maybe-enable-transcript-mode
@@ -1225,7 +1306,10 @@ while the minibuffer is busy."
   "Resume SESSION-ID using agent-shell, skipping shell picker.
 Uses the transcript Agent header to select the original agent when
 available, then starts a new shell buffer with the session loaded.
-When TRANSCRIPT-FILE is provided, sets working directory from the transcript."
+When TRANSCRIPT-FILE is provided, sets working directory from the transcript.
+Search-symlink paths are resolved before continuing the transcript."
+  (when transcript-file
+    (setq transcript-file (agent-recall--canonical-transcript-path transcript-file)))
   (let* ((transcript-agent (and transcript-file
                                 (agent-recall--read-agent-name transcript-file)))
          (default-directory (or (and transcript-file
