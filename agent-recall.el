@@ -643,6 +643,23 @@ backslash in the argv (e.g. \"\\\\*.md\"), and ripgrep would match nothing."
 
 ;;;; Search
 
+(defun agent-recall--symlink-link-name (project count)
+  "Return a search-tree link name for PROJECT with collision COUNT.
+Leading dots are stripped/rewritten so ripgrep will enter the directory:
+rg skips hidden paths by default, so a link named `.emacs.d' would make
+~/.emacs.d transcripts invisible to `agent-recall-search-live'."
+  (let* ((safe (cond
+                ((or (not project) (string-empty-p project)) "project")
+                ((string-match-p "\\`\\.\\'" project) "dot")
+                ((string-prefix-p "." project)
+                 (concat "dot-" (substring project 1)))
+                (t project)))
+         ;; Extra safety: never let the link basename start with `.'.
+         (safe (if (string-prefix-p "." safe)
+                   (concat "dot-" (substring safe 1))
+                 safe)))
+    (if (zerop count) safe (format "%s-%d" safe count))))
+
 (defun agent-recall--ensure-symlink-dir ()
   "Create a directory with symlinks to all transcript dirs.
 Returns the path.  Each symlink is named PROJECT-COUNT to avoid
@@ -651,7 +668,10 @@ The directory lives alongside `agent-recall-index-file'.
 
 Link targets are real directories only.  Paths under the search tree
 itself are ignored so a polluted index cannot recreate self-referential
-symlinks (which break unlock-file / ripgrep with ELOOP)."
+symlinks (which break unlock-file / ripgrep with ELOOP).
+
+Link names never start with `.' so ripgrep (which skips hidden paths)
+will search them."
   (let* ((base (agent-recall--search-base-dir))
          (dirs (agent-recall--index-dirs)))
     (when (file-exists-p base)
@@ -669,8 +689,7 @@ symlinks (which break unlock-file / ripgrep with ELOOP)."
                               (error (file-name-nondirectory
                                       (directory-file-name target)))))
                    (count (gethash project seen 0))
-                   (link-name (if (= count 0) project
-                                (format "%s-%d" project count)))
+                   (link-name (agent-recall--symlink-link-name project count))
                    (link (expand-file-name link-name base)))
               (puthash project (1+ count) seen)
               (condition-case nil
@@ -678,6 +697,7 @@ symlinks (which break unlock-file / ripgrep with ELOOP)."
                 (error nil)))))))
     (setq agent-recall--symlink-dir base)
     base))
+
 (defun agent-recall--install-transcript-hook ()
   "Add transcript-mode hook to `find-file-hook' if not already present."
   (unless (memq #'agent-recall--maybe-enable-from-search find-file-hook)
